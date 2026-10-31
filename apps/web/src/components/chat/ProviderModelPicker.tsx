@@ -68,9 +68,8 @@ function lockBackgroundScroll(popup: HTMLElement | null) {
   };
 }
 
-/** What a docked effort column needs from its picker: the model it serves, and a way to close. */
-export const DockedPickerContext = createContext<{ modelLabel: string; close: () => void }>({
-  modelLabel: "",
+/** Lets the docked effort column and footer close their picker. */
+export const DockedPickerContext = createContext<{ close: () => void }>({
   close: () => {},
 });
 
@@ -405,9 +404,7 @@ export const ProviderModelPicker = memo(function ProviderModelPicker(props: {
         touchBackdrop
       >
         {props.effortColumn ? (
-          <DockedPickerContext
-            value={{ modelLabel: triggerTitle, close: () => setIsMenuOpen(false) }}
-          >
+          <DockedPickerContext value={{ close: () => setIsMenuOpen(false) }}>
             <div className="flex flex-col">
               <div className="flex max-h-86.5 max-sm:max-h-none max-sm:flex-col">
                 {picker}
