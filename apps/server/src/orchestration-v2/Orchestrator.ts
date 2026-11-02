@@ -4466,7 +4466,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           ? {
               sideChat: true,
               sideChatRuntimeMode: resolveProjectSettings(
-                yield* serverSettings.getSettings.pipe(Effect.orDie),
+                yield* serverSettings.getSettings.pipe(mapDispatchError(command)),
                 sourceProjection.thread.projectId,
               ).settings.sideChatRuntimeMode,
             }
