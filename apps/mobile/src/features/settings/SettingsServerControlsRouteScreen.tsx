@@ -275,6 +275,15 @@ function ServerSettingsDetail(props: { readonly page: SettingsPage }) {
     RUNTIME_MODE_CHOICES,
     targets.map((target) => target.environment.serverConfig.managedPolicy),
   );
+  const sideChatRuntimeModeChoices = [
+    ...runtimeModeChoices,
+    {
+      mode: "inherit-parent" as const,
+      label: "Inherit parent",
+      description: "Use the parent’s current permissions, within administrator limits.",
+      disabledReason: undefined,
+    },
+  ];
   const disabledFor = (key: string) =>
     disabled ||
     managed(key) !== undefined ||
@@ -366,7 +375,10 @@ function ServerSettingsDetail(props: { readonly page: SettingsPage }) {
                         ) : null
                       }
                     >
-                      {runtimeModeChoices.map((choice, index) => (
+                      {(key === "sideChatRuntimeMode"
+                        ? sideChatRuntimeModeChoices
+                        : runtimeModeChoices
+                      ).map((choice, index) => (
                         <SettingsChoiceRow
                           key={choice.mode}
                           label={choice.label}
