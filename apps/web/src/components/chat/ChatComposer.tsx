@@ -1847,6 +1847,99 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     };
   };
 
+  const blurMobileComposerAfterSend = () => {
+    if (!isSoftwareKeyboardOpen) return;
+    if (composerBlurFrameRef.current !== null) {
+      window.cancelAnimationFrame(composerBlurFrameRef.current);
+      composerBlurFrameRef.current = null;
+    }
+    const activeElement = document.activeElement;
+    if (activeElement instanceof HTMLElement) {
+      activeElement.blur();
+    }
+    setIsComposerFocused(false);
+  };
+
+  const shouldBlurMobileComposerOnSubmit = () => {
+    if (!isSoftwareKeyboardOpen) return false;
+    if (
+      isSendBusy ||
+      isSendDisabled ||
+      noProviderAvailable ||
+      environmentUnavailable !== null ||
+      phase === "running"
+    ) {
+      return false;
+    }
+    if (activePendingProgress) {
+      return activePendingProgress.isLastQuestion && Boolean(activePendingResolvedAnswers);
+    }
+    return showPlanFollowUpPrompt || composerSendState.hasSendableContent;
+  };
+
+  const submitComposer = (
+    event?: { preventDefault: () => void },
+    dispatchMode?: ComposerDispatchMode,
+    submissionIntent?: ComposerSubmissionIntent,
+  ) => {
+    if (
+      noProviderAvailable ||
+      isSendDisabled ||
+      !readEnvironmentScope(environmentId, AuthOrchestrationOperateScope)
+    ) {
+      event?.preventDefault();
+      return;
+    }
+    // A send while a pasted image is still compressing would strand that image:
+    // the turn snapshot wouldn't include it, and it would surface in the *next*
+    // draft instead.
+    if (activeThreadId && countPreparingComposerImages(attachmentTargetKey) > 0) {
+      event?.preventDefault();
+      toastManager.add({
+        type: "info",
+        title: "Still compressing a pasted image.",
+        description: "Send again once its thumbnail appears.",
+      });
+      return;
+    }
+    if (pendingDraftWork.has(attachmentTargetKey)) {
+      event?.preventDefault();
+      toastManager.add({
+        type: "info",
+        title: "Still bringing attached context into this message.",
+        description: "Send again once its chip resolves.",
+      });
+      return;
+    }
+    const submission = submitComposerDraft({
+      prompt: promptRef.current,
+      submissionTarget: activePendingProgress ? "pending-user-input" : "provider-turn",
+      event,
+      onSend: (sendEvent) => {
+        providerInputRejectedRef.current = false;
+        onSend(
+          sendEvent,
+          dispatchMode ??
+            resolveComposerDispatchMode({
+              running: phase === "running",
+              alternateModifier: false,
+              activeTurnDefault: followUpBehavior,
+              canSteer: !isCompacting,
+            }),
+          submissionIntent,
+        );
+        return !providerInputRejectedRef.current;
+      },
+    });
+    setComposerSubmissionError(submission.validationMessage);
+    if (!submission.didDispatch) return;
+    onTypingGuardSend();
+    if (shouldBlurMobileComposerOnSubmit()) {
+      blurMobileComposerAfterSend();
+    }
+  };
+  const submitComposerStable = useStableCallback(submitComposer);
+
   const { onUsageLimitsCommand } = props;
   const onSelectComposerItem = (item: ComposerCommandItem) => {
     if (composerSelectLockRef.current) return;
@@ -1886,13 +1979,28 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       }
       if (item.command === "side" || item.command === "btw") {
         if (props.sideChatDisabledReason) return;
+        const openImmediately =
+          snapshot.value.slice(0, trigger.rangeStart).trim() === "" &&
+          snapshot.value.slice(trigger.rangeEnd).trim() === "";
+        const replacement = `/${item.command} `;
+        const replacementRangeEnd = extendReplacementRangeForTrailingSpace(
+          snapshot.value,
+          trigger.rangeEnd,
+          replacement,
+        );
         const applied = applyPromptReplacement(
           trigger.rangeStart,
-          trigger.rangeEnd,
-          `/${item.command} `,
-          { expectedText: snapshot.value.slice(trigger.rangeStart, trigger.rangeEnd) },
+          replacementRangeEnd,
+          replacement,
+          {
+            expectedText: snapshot.value.slice(trigger.rangeStart, replacementRangeEnd),
+            focusEditorAfterReplace: !openImmediately,
+          },
         );
-        if (applied) setComposerHighlightedItemId(null);
+        if (applied) {
+          setComposerHighlightedItemId(null);
+          if (openImmediately) submitComposer();
+        }
         return;
       }
       if (!planModeUiEnabled) return;
@@ -2037,98 +2145,6 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     setComposerHighlightedItemId(nextItem?.id ?? null);
   };
 
-  const blurMobileComposerAfterSend = () => {
-    if (!isSoftwareKeyboardOpen) return;
-    if (composerBlurFrameRef.current !== null) {
-      window.cancelAnimationFrame(composerBlurFrameRef.current);
-      composerBlurFrameRef.current = null;
-    }
-    const activeElement = document.activeElement;
-    if (activeElement instanceof HTMLElement) {
-      activeElement.blur();
-    }
-    setIsComposerFocused(false);
-  };
-
-  const shouldBlurMobileComposerOnSubmit = () => {
-    if (!isSoftwareKeyboardOpen) return false;
-    if (
-      isSendBusy ||
-      isSendDisabled ||
-      noProviderAvailable ||
-      environmentUnavailable !== null ||
-      phase === "running"
-    ) {
-      return false;
-    }
-    if (activePendingProgress) {
-      return activePendingProgress.isLastQuestion && Boolean(activePendingResolvedAnswers);
-    }
-    return showPlanFollowUpPrompt || composerSendState.hasSendableContent;
-  };
-
-  const submitComposer = (
-    event?: { preventDefault: () => void },
-    dispatchMode?: ComposerDispatchMode,
-    submissionIntent?: ComposerSubmissionIntent,
-  ) => {
-    if (
-      noProviderAvailable ||
-      isSendDisabled ||
-      !readEnvironmentScope(environmentId, AuthOrchestrationOperateScope)
-    ) {
-      event?.preventDefault();
-      return;
-    }
-    // A send while a pasted image is still compressing would strand that image:
-    // the turn snapshot wouldn't include it, and it would surface in the *next*
-    // draft instead.
-    if (activeThreadId && countPreparingComposerImages(attachmentTargetKey) > 0) {
-      event?.preventDefault();
-      toastManager.add({
-        type: "info",
-        title: "Still compressing a pasted image.",
-        description: "Send again once its thumbnail appears.",
-      });
-      return;
-    }
-    if (pendingDraftWork.has(attachmentTargetKey)) {
-      event?.preventDefault();
-      toastManager.add({
-        type: "info",
-        title: "Still bringing attached context into this message.",
-        description: "Send again once its chip resolves.",
-      });
-      return;
-    }
-    const submission = submitComposerDraft({
-      prompt: promptRef.current,
-      submissionTarget: activePendingProgress ? "pending-user-input" : "provider-turn",
-      event,
-      onSend: (sendEvent) => {
-        providerInputRejectedRef.current = false;
-        onSend(
-          sendEvent,
-          dispatchMode ??
-            resolveComposerDispatchMode({
-              running: phase === "running",
-              alternateModifier: false,
-              activeTurnDefault: followUpBehavior,
-              canSteer: !isCompacting,
-            }),
-          submissionIntent,
-        );
-        return !providerInputRejectedRef.current;
-      },
-    });
-    setComposerSubmissionError(submission.validationMessage);
-    if (!submission.didDispatch) return;
-    onTypingGuardSend();
-    if (shouldBlurMobileComposerOnSubmit()) {
-      blurMobileComposerAfterSend();
-    }
-  };
-  const submitComposerStable = useStableCallback(submitComposer);
   const handleSubmitMessage = (event: React.MouseEvent<HTMLButtonElement>) => {
     event.preventDefault();
     submitComposer(
