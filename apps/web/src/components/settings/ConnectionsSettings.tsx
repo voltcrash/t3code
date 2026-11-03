@@ -1,3 +1,4 @@
+import { tailscaleServeFailureMessage } from "@t3tools/contracts";
 import { SessionPermissions } from "./SessionPermissions";
 import { ChevronRightIcon, EllipsisIcon } from "lucide-react";
 import { useAtomValue } from "@effect/atom-react";
@@ -460,7 +461,7 @@ export function ConnectionsSettings({ view }: { readonly view: "environments" | 
     setIsUpdatingTailscaleServe(false);
   };
 
-  const handleStartTailscaleServeDisable = (_endpoint: AdvertisedEndpoint) => {
+  const handleStartTailscaleServeDisable = () => {
     setDisableTailscaleServeDialogOpen(true);
   };
 
@@ -607,6 +608,11 @@ export function ConnectionsSettings({ view }: { readonly view: "environments" | 
 
   const visibleDesktopPairingLinks = desktopPairingLinks;
   const tailscaleHttpsEndpoint = desktopAdvertisedEndpoints.find(isTailscaleHttpsEndpoint) ?? null;
+  const tailscaleServeEnabled = desktopServerExposureState?.tailscaleServeEnabled ?? false;
+  const tailscaleFailure =
+    tailscaleHttpsEndpoint?.status === "available"
+      ? null
+      : tailscaleServeFailureMessage(primaryServerConfig?.tailscaleServeFailure);
   const visibleDesktopNetworkAdvertisedEndpoints = isLocalBackendNetworkAccessible
     ? desktopAdvertisedEndpoints.filter((endpoint) => !isTailscaleHttpsEndpoint(endpoint))
     : [];
@@ -903,29 +909,30 @@ export function ConnectionsSettings({ view }: { readonly view: "environments" | 
     <SettingsRow
       title={searchableSetting("tailscale-https").title}
       description={
-        tailscaleHttpsEndpoint
+        tailscaleFailure ??
+        (tailscaleHttpsEndpoint
           ? tailscaleHttpsEndpoint.status === "available"
             ? tailscaleHttpsEndpoint.httpBaseUrl
             : "Use Tailscale Serve to expose this backend through a MagicDNS HTTPS URL."
-          : missingTailscaleEndpointDescription(desktopServerExposureState)
+          : missingTailscaleEndpointDescription(desktopServerExposureState))
       }
       control={
-        tailscaleHttpsEndpoint ? (
+        tailscaleHttpsEndpoint || tailscaleServeEnabled ? (
           <Switch
-            checked={tailscaleHttpsEndpoint.status === "available"}
+            checked={tailscaleServeEnabled}
             disabled={isUpdatingTailscaleServe}
             onCheckedChange={(checked) => {
-              if (checked) {
+              if (checked && tailscaleHttpsEndpoint) {
                 handleStartTailscaleServeSetup(tailscaleHttpsEndpoint);
                 return;
               }
-              handleStartTailscaleServeDisable(tailscaleHttpsEndpoint);
+              handleStartTailscaleServeDisable();
             }}
             aria-label="Enable Tailscale HTTPS"
           />
         ) : null
       }
-      managed={tailscaleHttpsEndpoint?.status === "available" ? undefined : remoteClientsDenial}
+      managed={tailscaleServeEnabled ? undefined : remoteClientsDenial}
     />
   );
   const renderAuthorizedClients = () => (
@@ -1127,6 +1134,9 @@ export function ConnectionsSettings({ view }: { readonly view: "environments" | 
             ) : canManageLocalBackend ? (
               <>
                 {renderDisabledNetworkAccessRow()}
+                {tailscaleFailure ? (
+                  <SettingsRow title="Tailscale HTTPS" description={tailscaleFailure} />
+                ) : null}
                 {canReadRelay || canManageRelay ? (
                   <CloudLinkRow canReadRelay={canReadRelay} canManageRelay={canManageRelay} />
                 ) : null}
