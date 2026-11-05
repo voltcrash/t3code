@@ -1549,6 +1549,34 @@ describe("decodePullRequestFilesJson", () => {
     expect(result.patch).toContain("diff --git a/src/app.ts b/src/app.ts");
     expect(result.truncated).toBe(true);
     expect(result.rawCount).toBe(2);
+    expect(result.omittedFileStats).toEqual([{ path: "logo.png", additions: 4, deletions: 2 }]);
+  });
+
+  it("does not trust zero counts to mean a patchless file is empty", () => {
+    const result = expectSuccess(
+      decodePullRequestFilesJson(
+        JSON.stringify([
+          { filename: "example.cs", status: "added", additions: 0, deletions: 0 },
+          { filename: "removed.cs", status: "removed", additions: 0, deletions: 0 },
+          { filename: "modified.cs", status: "modified" },
+          {
+            filename: "renamed.cs",
+            previous_filename: "old.cs",
+            status: "renamed",
+            additions: 0,
+            deletions: 0,
+          },
+        ]),
+      ),
+    );
+
+    expect(result.truncated).toBe(true);
+    expect(result.omittedFileStats).toEqual([
+      { path: "example.cs", additions: 0, deletions: 0 },
+      { path: "removed.cs", additions: 0, deletions: 0 },
+      { path: "modified.cs", additions: 0, deletions: 0 },
+    ]);
+    expect(result.patch).toContain("similarity index 100%");
   });
 });
 

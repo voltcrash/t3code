@@ -9,7 +9,7 @@ import { expect, it, vi } from "vite-plus/test";
 
 import "~/index.css";
 
-const { diffAtom, pagedDiffAtom } = await vi.hoisted(async () => {
+const { diffAtom, pagedDiffAtom, omittedDiffAtom } = await vi.hoisted(async () => {
   const { AsyncResult, Atom } = await import("effect/reactivity");
   const filePatch = (path: string) =>
     [
@@ -44,17 +44,31 @@ const { diffAtom, pagedDiffAtom } = await vi.hoisted(async () => {
     // An environment query whose refetch returns equal content hands back the previous value
     // itself, so a refresh publishes a new result around the very same page.
     diffAtom: Atom.make(() => AsyncResult.success(firstPage)),
+    omittedDiffAtom: Atom.make(() =>
+      AsyncResult.success({
+        patch:
+          "diff --git a/example.cs b/example.cs\nnew file mode 100644\n--- /dev/null\n+++ b/example.cs\n",
+        truncated: true,
+        nextCursor: null,
+        omittedFileStats: [{ path: "example.cs", additions: 0, deletions: 0 }],
+      } satisfies PullRequestDiffResult),
+    ),
     pagedDiffAtom: Atom.family((cursor: string) =>
       Atom.make(() => AsyncResult.success(pages[cursor]!)),
     ),
   };
 });
 
-const mocks = vi.hoisted(() => ({ paged: false, diffCommits: [] as Array<string | undefined> }));
+const mocks = vi.hoisted(() => ({
+  paged: false,
+  omitted: false,
+  diffCommits: [] as Array<string | undefined>,
+  contents: vi.fn(),
+}));
 
 vi.mock(import("~/state/use-atom-command"), async (original) => ({
   ...(await original()),
-  useAtomCommand: (() => vi.fn()) as never,
+  useAtomCommand: (() => mocks.contents) as never,
 }));
 vi.mock(import("~/state/pullRequests"), async (original) => {
   const actual = await original();
@@ -64,7 +78,11 @@ vi.mock(import("~/state/pullRequests"), async (original) => {
       ...actual.pullRequestEnvironment,
       diff: (({ input }: { input: { cursor?: string; commit?: string } }) => {
         mocks.diffCommits.push(input.commit);
-        return mocks.paged ? pagedDiffAtom(input.cursor ?? "first") : diffAtom;
+        return mocks.omitted
+          ? omittedDiffAtom
+          : mocks.paged
+            ? pagedDiffAtom(input.cursor ?? "first")
+            : diffAtom;
       }) as never,
     },
   };
@@ -127,6 +145,8 @@ const detail: PullRequestDetailView = {
 
 function setup({ paged }: { paged: boolean }) {
   mocks.paged = paged;
+  mocks.omitted = false;
+  mocks.contents.mockReset();
   mocks.diffCommits = [];
 }
 
@@ -235,4 +255,65 @@ it("never requests the diff of a selected commit the pull request no longer has"
     .element(screen.getByRole("button", { name: "Diff scope: All commits" }))
     .toBeVisible();
   expect(mocks.diffCommits).not.toContain("gone");
+});
+
+it("recovers a patchless file on demand and forgets it when refreshed", async () => {
+  setup({ paged: false });
+  mocks.omitted = true;
+  mocks.contents.mockResolvedValue({
+    _tag: "Success",
+    value: { oldContents: "", newContents: "recovered();\n" },
+  });
+  const container = pagedContainer();
+  container.classList.remove("flex");
+  await using screen = await render(tab(0), { container });
+  await expect.element(screen.getByRole("button", { name: "Load diff" })).toBeVisible();
+  expect(mocks.contents).not.toHaveBeenCalled();
+
+  await screen.getByRole("button", { name: "Load diff" }).click();
+
+  await expect.element(screen.getByText("+1", { exact: true }).first()).toBeVisible();
+  await expect.element(screen.getByRole("button", { name: "Load diff" })).not.toBeInTheDocument();
+  // Recovery should reveal the file even if diffs start folded.
+  await vi.waitFor(() => {
+    const hosts = [...screen.container.querySelectorAll("diffs-container")];
+    expect(hosts.map((host) => host.shadowRoot?.textContent).join("\n")).toContain("recovered");
+  });
+
+  await screen.getByRole("button", { name: /^(Show|Hide) whitespace changes$/ }).click();
+  await expect.element(screen.getByText("+1", { exact: true }).first()).toBeVisible();
+  await expect.element(screen.getByRole("button", { name: "Load diff" })).not.toBeInTheDocument();
+  expect(mocks.contents).toHaveBeenCalledTimes(1);
+
+  await screen.rerender(tab(1));
+  await expect.element(screen.getByRole("button", { name: "Load diff" })).toBeVisible();
+  mocks.contents.mockResolvedValue({
+    _tag: "Success",
+    value: { oldContents: "", newContents: "refreshed();\n" },
+  });
+  await screen.getByRole("button", { name: "Load diff" }).click();
+  await vi.waitFor(() => {
+    const hosts = [...screen.container.querySelectorAll("diffs-container")];
+    expect(hosts.map((host) => host.shadowRoot?.textContent).join("\n")).toContain("refreshed");
+  });
+});
+
+it("shows an unavailable state without a dead-end retry, and verifies empty files after refresh", async () => {
+  setup({ paged: false });
+  mocks.omitted = true;
+  mocks.contents.mockResolvedValueOnce({ _tag: "Failure" });
+  mocks.contents.mockResolvedValueOnce({
+    _tag: "Success",
+    value: { oldContents: "", newContents: "" },
+  });
+  const container = pagedContainer();
+  container.classList.remove("flex");
+  await using screen = await render(tab(0), { container });
+  await screen.getByRole("button", { name: "Load diff" }).click();
+  await expect.element(screen.getByText("Diff unavailable")).toBeVisible();
+  await expect.element(screen.getByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+  await expect.element(screen.getByRole("button", { name: "Load diff" })).not.toBeInTheDocument();
+  await screen.rerender(tab(1));
+  await screen.getByRole("button", { name: "Load diff" }).click();
+  await expect.element(screen.getByText("No text changes")).toBeVisible();
 });

@@ -2,7 +2,13 @@ import {
   capitalizeTerm,
   sourceControlClients,
 } from "@t3tools/client-runtime/source-control-clients";
-import type { CodeViewItem, DiffLineAnnotation, SelectedLineRange } from "@pierre/diffs";
+import {
+  parseDiffFromFile,
+  type CodeViewItem,
+  type DiffLineAnnotation,
+  type FileDiffMetadata,
+  type SelectedLineRange,
+} from "@pierre/diffs";
 import type { CodeViewAnnotationArgs, CodeViewDiffItem } from "@pierre/diffs/react";
 import type {
   EnvironmentId,
@@ -56,8 +62,10 @@ import { isTestChangedFile } from "@t3tools/shared/changedFileKind";
 import { orderDiffFiles } from "./pullRequestFileOrder.logic";
 import {
   buildFileDiffRenderKey,
+  buildFileDiffIdentityKey,
   fnv1a32,
   getDiffLineStat,
+  hideWhitespaceChanges,
   getRenderablePatch,
   resolveDiffThemeName,
   resolveFileDiffPath,
@@ -156,6 +164,10 @@ const REPLACE_FILE_COUNTS_CSS = `
 }`;
 
 const NO_SLICES: ReadonlyArray<DiffSlice> = [];
+
+type OmittedDiffState =
+  | { readonly status: "loading" | "unavailable" }
+  | { readonly status: "loaded"; readonly file: FileDiffMetadata };
 
 // Query results outlive the panel's slices, so their parses survive closing and reopening
 // without retaining anything beyond the query cache's lifetime.
@@ -404,6 +416,16 @@ function PullRequestCodeTab({
       ? selectedCommitOid
       : null;
   const scopeKey = JSON.stringify([environmentId, referenceKey, commit]);
+  const recoveryKey = JSON.stringify([scopeKey, detail.updatedAt, refreshToken]);
+  const [omittedDiffs, setOmittedDiffs] = useState<{
+    readonly key: string;
+    readonly files: ReadonlyMap<string, OmittedDiffState>;
+  }>({ key: recoveryKey, files: new Map() });
+  if (omittedDiffs.key !== recoveryKey) {
+    setOmittedDiffs({ key: recoveryKey, files: new Map() });
+  }
+  const recoveredDiffs =
+    omittedDiffs.key === recoveryKey ? omittedDiffs.files : new Map<string, OmittedDiffState>();
   // The panel keeps this mounted across pull requests, so an open composer would otherwise
   // survive the switch and attach its comment to whichever one is on screen when it is sent.
   const [stateScopeKey, setStateScopeKey] = useState(scopeKey);
@@ -561,11 +583,23 @@ function PullRequestCodeTab({
   // Agent context is local, so it does not require host comment permission.
   const canSelectLines =
     commit === null && (review.inlineComment || onAddToAgentSelection !== undefined);
-  const { parsedSlices, loadedFiles, sourceFileStats } = diffModel(
+  const {
+    parsedSlices,
+    loadedFiles: initialFiles,
+    sourceFileStats,
+  } = diffModel(
     loadedSlices,
     `pull-request:${scopeKey}:${resolvedTheme}:${ignoreWhitespace}`,
     ignoreWhitespace,
   );
+  const loadedFiles = initialFiles.map((file) => {
+    const recovered = recoveredDiffs.get(buildFileDiffIdentityKey(file));
+    if (recovered?.status !== "loaded") return file;
+    return {
+      ...(ignoreWhitespace ? hideWhitespaceChanges(recovered.file) : recovered.file),
+      cacheKey: `${buildFileDiffRenderKey(file)}:hydrated`,
+    };
+  });
   const testFileCount = loadedFiles.filter((file) =>
     isTestChangedFile(resolveFileDiffPath(file)),
   ).length;
@@ -719,7 +753,9 @@ function PullRequestCodeTab({
         fileDiff,
         annotations,
         collapsed,
-        version: fnv1a32(`${collapsed ? "1" : "0"}:${viewedMark}:${annotationsVersion}`),
+        version: fnv1a32(
+          `${collapsed ? "1" : "0"}:${viewedMark}:${annotationsVersion}:${recoveredDiffs.get(buildFileDiffIdentityKey(fileDiff))?.status ?? ""}`,
+        ),
       };
     },
   );
@@ -894,26 +930,100 @@ function PullRequestCodeTab({
     );
   };
 
+  const recoverOmittedDiff = async (item: CodeViewDiffItem<ReviewAnnotationGroup>) => {
+    const setFile = (state: OmittedDiffState) =>
+      setOmittedDiffs((previous) =>
+        previous.key === recoveryKey
+          ? {
+              ...previous,
+              files: new Map(previous.files).set(buildFileDiffIdentityKey(item.fileDiff), state),
+            }
+          : previous,
+      );
+    setFile({ status: "loading" });
+    if (isFileDiffCollapsed(item.id, effectiveFoldOverride, toggledFiles)) toggleFile(item.id);
+    const file = item.fileDiff;
+    const path = resolveFileDiffPath(file);
+    const result = await getDiffFileContents({
+      environmentId,
+      input: {
+        ...reference,
+        ...(commit === null ? {} : { commit }),
+        changeType: file.type,
+        oldPath: resolveFileDiffPreviousPath(file),
+        newPath: path,
+      },
+    });
+    if (result._tag !== "Success") {
+      setFile({ status: "unavailable" });
+      return;
+    }
+    const recovered = parseDiffFromFile(
+      file.type === "new"
+        ? null
+        : { name: resolveFileDiffPreviousPath(file), contents: result.value.oldContents },
+      file.type === "deleted" ? null : { name: path, contents: result.value.newContents },
+    );
+    setFile({
+      status: "loaded",
+      file: {
+        ...recovered,
+        name: file.name,
+        ...(file.prevName === undefined ? {} : { prevName: file.prevName }),
+        type: file.type,
+      },
+    });
+  };
+
   const renderHeaderMetadata = (item: CodeViewItem<ReviewAnnotationGroup>) => {
     if (item.type !== "diff") return null;
-    let { additions, deletions } = sourceFileStats.get(item.id) ?? getDiffLineStat([item.fileDiff]);
+    const recovery = recoveredDiffs.get(buildFileDiffIdentityKey(item.fileDiff));
+    let { additions, deletions } =
+      recovery?.status === "loaded"
+        ? getDiffLineStat([recovery.file])
+        : (sourceFileStats.get(item.id) ?? getDiffLineStat([item.fileDiff]));
     const path = resolveFileDiffPath(item.fileDiff);
-    if (additions === 0 && deletions === 0) {
+    if (recovery?.status !== "loaded" && additions === 0 && deletions === 0) {
       const withheld = omittedFileStats.get(path);
       if (withheld) ({ additions, deletions } = withheld);
     }
+    const omitted = omittedFileStats.has(path);
     return (
-      <FileViewedToggle
-        fileKey={item.id}
-        path={path}
-        stat={
-          <PullRequestDiffStat
-            additions={additions}
-            deletions={deletions}
-            className="font-mono text-2xs"
-          />
-        }
-      />
+      <span className="flex items-center gap-3">
+        {omitted && recovery?.status !== "loaded" ? (
+          <>
+            <span className="text-2xs text-muted-foreground">
+              {recovery?.status === "unavailable" ? "Diff unavailable" : "Patch omitted"}
+            </span>
+            {recovery?.status !== "unavailable" ? (
+              <Button
+                size="xs"
+                variant="outline"
+                disabled={recovery?.status === "loading"}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  void recoverOmittedDiff(item);
+                }}
+              >
+                {recovery?.status === "loading" ? "Loading..." : "Load diff"}
+              </Button>
+            ) : null}
+          </>
+        ) : recovery?.status === "loaded" && additions === 0 && deletions === 0 ? (
+          <span className="text-2xs text-muted-foreground">No text changes</span>
+        ) : null}
+        <FileViewedToggle
+          fileKey={item.id}
+          path={path}
+          stat={
+            <PullRequestDiffStat
+              additions={additions}
+              deletions={deletions}
+              className="font-mono text-2xs"
+            />
+          }
+        />
+      </span>
     );
   };
 
